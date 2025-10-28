@@ -9,7 +9,7 @@ if (!mdPath) {
   console.error("MD_PATH env가 비어있습니다.");
   process.exit(1);
 }
-const blogUrl = process.env.sonowhstudy.tistory.com; // 예: https://fuzzlab.tistory.com
+const blogUrl = process.env.TISTORY_BLOG_URL;
 if (!blogUrl) {
   console.error("TISTORY_BLOG_URL env가 비어있습니다.");
   process.exit(1);
