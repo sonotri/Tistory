@@ -2,12 +2,20 @@ name: Publish MD to Tistory (Headless)
 
 on:
   push:
+    # 브랜치 제한이 필요하면 여기서 지정 (예: [ main, sonotri ])
     paths:
       - "posts/*.md"
+  workflow_dispatch: {}
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+
+    # 공통 환경변수 (여기 블로그 주소만 네 것으로 수정!)
+    env:
+      TISTORY_BLOG_URL: "https://sonowhstudy.tistory.com" # ← 마지막 슬래시 없이!
+      # 세션은 GitHub Secrets에 TISTORY_STORAGE_B64 로 저장해두어야 합니다.
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,31 +25,49 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install deps
+      - name: Install deps (npm + Playwright)
         run: |
-          npm i
+          npm ci || npm i
+          npx playwright install --with-deps
 
-      # 변경된 md 파일만 추출 (첫 커밋/여러 파일 케이스도 고려)
+      # 변경된 md 목록 추출 (이번 커밋에서 posts/*.md 만)
       - name: Detect changed MD
         id: changed
-        run: |
-          echo "files<<EOF" >> $GITHUB_OUTPUT
-          git diff --name-only HEAD^ HEAD 2>/dev/null | grep '^posts/.*\.md$' || true >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Print changed MD
-        run: |
-          echo "${{ steps.changed.outputs.files }}"
-
-      - name: Publish each MD
-        if: ${{ steps.changed.outputs.files != '' }}
-        env:
-          TISTORY_STORAGE_B64: ${{ secrets.TISTORY_STORAGE_B64 }}
-          TISTORY_BLOG_URL: "https://sonowhstudy.tistory.com/" # <- 본인 블로그 URL
+        shell: bash
         run: |
           set -e
-          IFS=$'\n'
-          for f in ${{ steps.changed.outputs.files }}; do
+          git diff --name-only HEAD^ HEAD 2>/dev/null | grep '^posts/.*\.md$' || true > changed.txt
+          echo "----- Changed MD files -----"
+          cat changed.txt || true
+          COUNT=$(wc -l < changed.txt | tr -d ' ')
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Fail if no MD
+        if: ${{ steps.changed.outputs.count == '0' }}
+        run: |
+          echo "No posts/*.md in last commit."
+          exit 1
+
+      - name: Publish each MD to Tistory
+        env:
+          TISTORY_STORAGE_B64: ${{ secrets.TISTORY_STORAGE_B64 }}
+        shell: bash
+        run: |
+          set -e
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
             echo "Posting $f"
             MD_PATH="$f" node ./scripts/post.mjs
-          done
+          done < changed.txt
+
+      # 디버깅 자료(스크린샷/HTML/비디오) 업로드 — 실패 원인 파악용
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-debug
+          path: |
+            screenshots/
+            page.html
+            video.webm
+          if-no-files-found: ignore
