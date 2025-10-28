@@ -2,11 +2,13 @@ name: Publish MD to Tistory (Headless)
 
 on:
   push:
-    # 브랜치 제한이 필요하면 여기서 지정 (예: [ main, sonotri ])
-    paths:
-      - "posts/*.md"
-  workflow_dispatch: {}
-
+    branches: [sonotri] # 너의 브랜치명
+  workflow_dispatch:
+    inputs:
+      md_path:
+        description: "posts/*.md 경로(선택)"
+        required: false
+        default: ""
 jobs:
   publish:
     runs-on: ubuntu-latest
