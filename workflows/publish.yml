@@ -1,0 +1,47 @@
+name: Publish MD to Tistory (Headless)
+
+on:
+  push:
+    paths:
+      - "posts/*.md"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: |
+          npm i
+
+      # 변경된 md 파일만 추출 (첫 커밋/여러 파일 케이스도 고려)
+      - name: Detect changed MD
+        id: changed
+        run: |
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          git diff --name-only HEAD^ HEAD 2>/dev/null | grep '^posts/.*\.md$' || true >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Print changed MD
+        run: |
+          echo "${{ steps.changed.outputs.files }}"
+
+      - name: Publish each MD
+        if: ${{ steps.changed.outputs.files != '' }}
+        env:
+          TISTORY_STORAGE_B64: ${{ secrets.TISTORY_STORAGE_B64 }}
+          TISTORY_BLOG_URL: "https://sonowhstudy.tistory.com/" # <- 본인 블로그 URL
+        run: |
+          set -e
+          IFS=$'\n'
+          for f in ${{ steps.changed.outputs.files }}; do
+            echo "Posting $f"
+            MD_PATH="$f" node ./scripts/post.mjs
+          done
