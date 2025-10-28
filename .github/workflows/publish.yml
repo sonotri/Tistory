@@ -2,21 +2,20 @@ name: Publish MD to Tistory (Headless)
 
 on:
   push:
-    branches: [sonotri] # 너의 브랜치명
+    branches: [sonotri] # ← 네 브랜치명
   workflow_dispatch:
     inputs:
       md_path:
         description: "posts/*.md 경로(선택)"
         required: false
         default: ""
+
 jobs:
   publish:
     runs-on: ubuntu-latest
 
-    # 공통 환경변수 (여기 블로그 주소만 네 것으로 수정!)
     env:
-      TISTORY_BLOG_URL: "https://sonowhstudy.tistory.com" # ← 마지막 슬래시 없이!
-      # 세션은 GitHub Secrets에 TISTORY_STORAGE_B64 로 저장해두어야 합니다.
+      TISTORY_BLOG_URL: "https://sonowhstudy.tistory.com" # ← 본인 주소(끝에 / 금지)
 
     steps:
       - name: Checkout
@@ -32,37 +31,57 @@ jobs:
           npm ci || npm i
           npx playwright install --with-deps
 
-      # 변경된 md 목록 추출 (이번 커밋에서 posts/*.md 만)
-      - name: Detect changed MD
-        id: changed
+      # 대상 MD 선택: (1) 입력값 > (2) 변경분 > (3) 최신 MD
+      - name: Detect target MD
+        id: detect
         shell: bash
         run: |
           set -e
-          git diff --name-only HEAD^ HEAD 2>/dev/null | grep '^posts/.*\.md$' || true > changed.txt
-          echo "----- Changed MD files -----"
-          cat changed.txt || true
-          COUNT=$(wc -l < changed.txt | tr -d ' ')
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          INPUT="${{ github.event.inputs.md_path }}"
+          if [ -n "$INPUT" ]; then
+            echo "files=$INPUT" >> $GITHUB_OUTPUT
+            echo "[detect] use input: $INPUT"
+            exit 0
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          git diff --name-only "$BEFORE" "$AFTER" | grep '^posts/.*\.md$' || true > changed.txt
+
+          if [ -s changed.txt ]; then
+            FIRST=$(head -n1 changed.txt)
+            echo "files=$FIRST" >> $GITHUB_OUTPUT
+            echo "[detect] changed md: $FIRST"
+            exit 0
+          fi
+
+          # 변경이 없으면 레포에서 가장 최근 수정된 md를 선택
+          LATEST=$(git ls-files 'posts/*.md' | while read f; do
+            echo "$(git log -1 --format=%ct -- "$f") $f"
+          done | sort -nr | head -n1 | cut -d' ' -f2- || true)
+
+          if [ -n "$LATEST" ]; then
+            echo "files=$LATEST" >> $GITHUB_OUTPUT
+            echo "[detect] fallback latest md: $LATEST"
+          else
+            echo "files=" >> $GITHUB_OUTPUT
+            echo "[detect] no posts/*.md found in repo"
+          fi
 
       - name: Fail if no MD
-        if: ${{ steps.changed.outputs.count == '0' }}
+        if: ${{ steps.detect.outputs.files == '' }}
         run: |
-          echo "No posts/*.md in last commit."
+          echo "No posts/*.md to publish (none changed and none found)."
           exit 1
 
-      - name: Publish each MD to Tistory
+      - name: Publish to Tistory
         env:
           TISTORY_STORAGE_B64: ${{ secrets.TISTORY_STORAGE_B64 }}
-        shell: bash
+          MD_PATH: ${{ steps.detect.outputs.files }}
         run: |
-          set -e
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            echo "Posting $f"
-            MD_PATH="$f" node ./scripts/post.mjs
-          done < changed.txt
+          echo "[publish] Posting $MD_PATH"
+          node ./scripts/post.mjs
 
-      # 디버깅 자료(스크린샷/HTML/비디오) 업로드 — 실패 원인 파악용
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
