@@ -1,143 +1,247 @@
+// scripts/post.mjs
 import fs from "fs";
 import path from "path";
 import { chromium } from "playwright";
 import { marked } from "marked";
 
-// 입력: 업로드할 MD 경로
-const mdPath = process.env.MD_PATH; // publish.yml에서 넘겨줌
-if (!mdPath) {
-  console.error("MD_PATH env가 비어있습니다.");
-  process.exit(1);
-}
+const mdPath = process.env.MD_PATH;
 const blogUrl = process.env.TISTORY_BLOG_URL;
-if (!blogUrl) {
-  console.error("TISTORY_BLOG_URL env가 비어있습니다.");
+const storageB64 = process.env.TISTORY_STORAGE_B64;
+
+function fatal(m) {
+  console.error(m);
   process.exit(1);
 }
+if (!mdPath) fatal("MD_PATH env missing.");
+if (!blogUrl) fatal("TISTORY_BLOG_URL env missing.");
+if (!storageB64) fatal("TISTORY_STORAGE_B64 secret missing.");
+if (!fs.existsSync(mdPath)) fatal(`MD not found: ${mdPath}`);
 
-// 1) MD 읽기 & HTML 변환
 const md = fs.readFileSync(mdPath, "utf8");
 const html = marked.parse(md);
+const h1 = md.match(/^#\s+(.+)$/m)?.[1];
+let title = (h1 || path.basename(mdPath, ".md")).trim().slice(0, 80);
 
-// 제목: MD 첫 번째 H1 또는 파일명
-let title = (md.match(/^#\s+(.+)$/m)?.[1] || path.basename(mdPath, ".md"))
-  .trim()
-  .slice(0, 80);
-
-// 2) storageState 복원
-const storageB64 = process.env.TISTORY_STORAGE_B64;
-if (!storageB64) {
-  console.error("TISTORY_STORAGE_B64 secret 필요");
-  process.exit(1);
-}
 const storageJson = Buffer.from(storageB64, "base64").toString("utf8");
 fs.writeFileSync("storageState.json", storageJson);
+await fs.promises.mkdir("screenshots", { recursive: true }).catch(() => {});
 
-// 3) 브라우저 실행
 const browser = await chromium.launch();
-const context = await browser.newContext({ storageState: "storageState.json" });
+const context = await browser.newContext({
+  storageState: "storageState.json",
+  recordVideo: { dir: ".", size: { width: 1280, height: 800 } },
+});
 const page = await context.newPage();
-
-// 4) 글쓰기 페이지 이동 (에디터 주소는 블로그/환경에 따라 조금 다름)
-await page.goto(`${blogUrl}/manage/post/write`, { waitUntil: "networkidle" });
-
-// ------------------------------
-// 에디터 셀렉터는 블로그/스킨/에디터 버전에 따라 달라질 수 있음.
-// 아래는 2가지 공략법을 섞어둠:
-//
-// (A) 제목 입력 필드 찾기
-// (B) 본문 편집 iframe/body에 HTML 주입
-// ------------------------------
-
-// (A) 제목 입력 시도 (여러 후보 셀렉터 중 존재하는 것 사용)
-const titleSelectors = [
-  'input[placeholder="제목"]',
-  "input.title",
-  'input[class*="title"]',
-  'input[name="title"]',
-];
-let titleSet = false;
-for (const sel of titleSelectors) {
-  const el = await page.$(sel);
-  if (el) {
-    await el.fill(title);
-    titleSet = true;
-    break;
-  }
-}
-if (!titleSet) {
-  console.warn("제목 입력 필드를 찾지 못했습니다. 에디터 셀렉터 확인 필요");
+async function snap(n) {
+  try {
+    await page.screenshot({ path: `screenshots/${n}.png`, fullPage: true });
+  } catch {}
 }
 
-// (B) 본문 주입: iframe 기반/에디터 div 기반 모두 시도
-// 1) iframe이 있다면 그 안의 body에 주입
-const iframe = await page.$("iframe");
-if (iframe) {
-  const frame = await iframe.contentFrame();
-  if (frame) {
-    await frame.evaluate((content) => {
-      // contenteditable body/루트 찾기
-      const body =
-        document.querySelector('body[contenteditable="true"], body') ||
-        document.body;
-      body.innerHTML = content;
-    }, html);
-  }
-} else {
-  // 2) iframe이 없다면 현재 페이지에서 contenteditable 요소 찾기
-  const editorCandidates = [
-    '[contenteditable="true"]',
-    ".editor-content",
-    ".se2_inputarea", // 구 에디터 케이스
-    "#editor", // 커스텀
+console.log("[INFO] Target blog:", blogUrl);
+console.log("[INFO] Title:", title);
+console.log("[INFO] MD:", mdPath);
+
+try {
+  // 0) 로그인 확인
+  await page.goto(`${blogUrl}/manage`, {
+    waitUntil: "networkidle",
+    timeout: 60000,
+  });
+  await snap("01-manage");
+  if (
+    page.url().includes("auth/login") ||
+    page.url().includes("accounts.kakao")
+  )
+    throw new Error(
+      "Not logged in (session expired). Recreate TISTORY_STORAGE_B64."
+    );
+
+  // 1) 글쓰기 페이지 오픈 (여러 후보 URL)
+  const writeUrls = [
+    `${blogUrl}/manage/post/write`,
+    `${blogUrl}/manage/newpost`,
+    `${blogUrl}/manage/post`, // 환경별 우회
   ];
-  let injected = false;
-  for (const sel of editorCandidates) {
-    const el = await page.$(sel);
-    if (el) {
-      await page.$eval(
-        sel,
-        (node, content) => {
-          node.innerHTML = content;
-        },
-        html
-      );
-      injected = true;
+  let ok = false;
+  for (const u of writeUrls) {
+    await page
+      .goto(u, { waitUntil: "networkidle", timeout: 60000 })
+      .catch(() => {});
+    await snap("02-write");
+    if (!page.url().includes("auth/login")) {
+      ok = true;
       break;
     }
   }
+  if (!ok) throw new Error("Cannot open write page");
+
+  // 2) DOM 힌트 로그 (제목/버튼 후보들을 찍어줌)
+  await page.evaluate(() => {
+    const info = [];
+    document.querySelectorAll("input,textarea,button").forEach((el) => {
+      const tag = el.tagName.toLowerCase();
+      const ph = el.getAttribute("placeholder") || "";
+      const nm = el.getAttribute("name") || "";
+      const id = el.id || "";
+      const cls = (el.className || "").toString().slice(0, 120);
+      const txt = (el.textContent || "").trim().slice(0, 30);
+      info.push({ tag, ph, nm, id, cls, txt });
+    });
+    console.log("@@DOM_HINT@@", JSON.stringify(info));
+  });
+
+  // 3) 제목 입력 (시도 폭 확대)
+  const titleSelectors = [
+    'input[placeholder*="제목"]',
+    'textarea[placeholder*="제목"]',
+    'input[name="title"]',
+    'textarea[name="title"]',
+    "#title",
+    "#post-title",
+    "#article-title",
+    'input[class*="title"]',
+    'textarea[class*="title"]',
+  ];
+  let setTitle = false;
+  for (const sel of titleSelectors) {
+    const el = await page.$(sel);
+    if (el) {
+      await el.fill(title);
+      setTitle = true;
+      break;
+    }
+  }
+  if (!setTitle)
+    console.log("제목 입력 필드를 찾지 못했습니다. 에디터 셀렉터 확인 필요");
+  await snap("03-title");
+
+  // 4) 본문 입력 (iframe/다양한 에디터 후보)
+  let injected = false;
+  // 4-1) iframe 우선
+  const iframes = await page.$$("iframe");
+  for (const ifr of iframes) {
+    const f = await ifr.contentFrame();
+    if (!f) continue;
+    try {
+      await f.evaluate((content) => {
+        const cands = [
+          '[contenteditable="true"]',
+          "#tinymce",
+          ".notion-page-content",
+          ".se2_inputarea",
+          "body",
+        ];
+        for (const c of cands) {
+          const node = document.querySelector(c);
+          if (node) {
+            node.innerHTML = content;
+            return;
+          }
+        }
+        throw new Error("no editor in frame");
+      }, html);
+      injected = true;
+      break;
+    } catch {}
+  }
+
+  // 4-2) 페이지 내 contenteditable/textarea 후보
   if (!injected) {
-    console.warn("본문 편집 영역을 찾지 못했습니다. 에디터 셀렉터 확인 필요");
+    const editorCands = [
+      '[contenteditable="true"]',
+      ".editor-content",
+      ".se2_inputarea",
+      "#editor",
+      ".tistoryEditor",
+      'div[role="textbox"]',
+      'textarea[name="content"]',
+      "textarea#content",
+    ];
+    for (const sel of editorCands) {
+      const el = await page.$(sel);
+      if (el) {
+        await page.$eval(
+          sel,
+          (n, c) => {
+            n.innerHTML ? (n.innerHTML = c) : (n.value = c);
+          },
+          html
+        );
+        injected = true;
+        break;
+      }
+    }
   }
-}
+  if (!injected)
+    console.log("본문 편집 영역을 찾지 못했습니다. 에디터 셀렉터 확인 필요");
+  await snap("04-body");
 
-// (선택) 태그/카테고리 입력 셀렉터가 있으면 여기에 추가로 입력/선택 로직 작성
-// 예:
-// await page.fill('input[name="tags"]', '티스토리,자동화,블로그');
-// await page.selectOption('select[name="category"]', '3'); // 카테고리 ID
-
-// (C) 발행 버튼 클릭 (여러 후보 셀렉터 중 가능한 것 사용)
-const publishSelectors = [
-  'button:has-text("발행")',
-  "button.publish",
-  'button:has-text("공개")',
-  'button:has-text("확인")',
-];
-let clicked = false;
-for (const sel of publishSelectors) {
-  const el = await page.$(sel);
-  if (el) {
-    await el.click();
-    clicked = true;
-    break;
+  // 5) 발행 버튼 클릭 (텍스트/데이터속성 다양한 후보)
+  const publishSelectors = [
+    'button:has-text("발행")',
+    'button:has-text("공개")',
+    'button:has-text("등록")',
+    'button:has-text("출간")',
+    'button:has-text("쓰기")',
+    '[data-action="publish"]',
+    ".btn_publish",
+    "button.publish",
+  ];
+  let clicked = false;
+  for (const sel of publishSelectors) {
+    const el = await page.$(sel);
+    if (el) {
+      await el.click();
+      clicked = true;
+      break;
+    }
   }
-}
-if (!clicked) {
-  console.warn("발행 버튼을 찾지 못했습니다. 에디터 셀렉터 확인 필요");
-}
+  if (!clicked)
+    console.log("발행 버튼을 찾지 못했습니다. 에디터 셀렉터 확인 필요");
+  await snap("05-after-click");
 
-// 발행 후 잠시 대기
-await page.waitForTimeout(3000);
+  // 6) 발행 검증 (목록에서 제목 찾기)
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await page.goto(`${blogUrl}/manage/posts`, {
+    waitUntil: "networkidle",
+    timeout: 60000,
+  });
+  await snap("06-posts");
+  const tabs = ["전체", "발행", "임시저장", "예약"];
+  let found = false;
+  for (const t of tabs) {
+    const btn = await page.$(`text=${t}`);
+    if (btn) {
+      await btn.click().catch(() => {});
+      await page.waitForLoadState("networkidle").catch(() => {});
+      await snap(`06-tab-${t}`);
+    }
+    const visible = await page
+      .locator(`text="${title}"`)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (visible) {
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    const dump = await page.content();
+    fs.writeFileSync("page.html", dump, "utf8");
+    await snap("07-not-found");
+    throw new Error("Post not found after publish (maybe draft/modal).");
+  }
 
+  console.log("업로드 완료:", title);
+} catch (e) {
+  console.error("[ERROR]", e.message);
+  try {
+    const dump = await page.content();
+    fs.writeFileSync("page.html", dump, "utf8");
+  } catch {}
+  await browser.close();
+  process.exit(1);
+}
 await browser.close();
-console.log("업로드 완료:", title);
